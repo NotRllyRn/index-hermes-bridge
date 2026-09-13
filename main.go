@@ -25,11 +25,14 @@ const (
 	pollInterval        = time.Second
 )
 
-const serverInstructions = "Use `ask_hermes` for every request in this sandbox. Pass the user's complete request in `message` without summarizing, rewriting, or omitting details. Return the tool result to the user as the answer."
+const serverInstructions = "Use `ask_hermes` for every request and pass the user's complete request unchanged. After Hermes responds, summarize the answer in 1-3 concise sentences suitable for a phone notification, preserving the conclusion and any immediately important action. Ignore tool-progress/status messages. Then call `deliver_response` with only that summary."
 
 type config struct{ MCPBearerToken, DiscordBotToken, DiscordChannelID, HermesBotID string }
 type askHermesInput struct {
 	Message string `json:"message" jsonschema:"The user's complete request to Hermes."`
+}
+type deliverResponseInput struct {
+	Text string `json:"text" jsonschema:"A concise 1-3 sentence summary for the user's phone notification."`
 }
 type workflowOptions struct{ overall, thread, poll time.Duration }
 
@@ -72,6 +75,13 @@ func newMCPHandler(cfg config, discord discordWorkflow, options workflowOptions)
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: &falseValue, IdempotentHint: false, OpenWorldHint: &trueValue},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input askHermesInput) (*mcp.CallToolResult, any, error) {
 		return askHermes(ctx, discord, cfg.HermesBotID, input, options), nil, nil
+	})
+	mcp.AddTool[deliverResponseInput, any](server, &mcp.Tool{
+		Name:        "deliver_response",
+		Description: "Deliver the concise final answer as the Pebble completion notification.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, DestructiveHint: &falseValue, IdempotentHint: true, OpenWorldHint: &falseValue},
+	}, func(_ context.Context, _ *mcp.CallToolRequest, input deliverResponseInput) (*mcp.CallToolResult, any, error) {
+		return deliverResponse(input.Text), nil, nil
 	})
 	streamable := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, &mcp.StreamableHTTPOptions{
 		JSONResponse:               true,
@@ -134,7 +144,7 @@ func askHermes(parent context.Context, discord discordWorkflow, hermesID string,
 				return pebbleFailure("Hermes completed without a text response.")
 			}
 			log.Printf("hermes completed id=%s", source.ID)
-			return pebbleResponse(text, message)
+			return textResult(text)
 		}
 		if err := sleepContext(ctx, options.poll); err != nil {
 			return timeoutFailure(parent)
@@ -149,8 +159,15 @@ func timeoutFailure(parent context.Context) *mcp.CallToolResult {
 	return pebbleFailure("Hermes did not respond before the Index timeout.")
 }
 
-func pebbleResponse(text, question string) *mcp.CallToolResult {
-	return &mcp.CallToolResult{Meta: mcp.Meta{"coreSchema": 1}, Content: []mcp.Content{&mcp.TextContent{Text: text}}, StructuredContent: map[string]any{"output": text, "semanticResult": map[string]any{"type": "Response", "text": text, "question": question}}}
+func textResult(text string) *mcp.CallToolResult {
+	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}
+}
+func deliverResponse(text string) *mcp.CallToolResult {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return pebbleFailure("No response was provided.")
+	}
+	return &mcp.CallToolResult{Meta: mcp.Meta{"coreSchema": 1}, Content: []mcp.Content{&mcp.TextContent{Text: text}}, StructuredContent: map[string]any{"output": text, "semanticResult": map[string]any{"type": "Response", "text": text}}}
 }
 func pebbleFailure(text string) *mcp.CallToolResult {
 	return &mcp.CallToolResult{Meta: mcp.Meta{"coreSchema": 1}, Content: []mcp.Content{&mcp.TextContent{Text: text}}, StructuredContent: map[string]any{"output": text, "semanticResult": map[string]any{"type": "GenericFailure", "userErrorMessage": text, "llmRecoverable": false, "forceFallbackTool": false}}, IsError: true}

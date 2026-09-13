@@ -1,5 +1,7 @@
 # Index Hermes Bridge — Software Design & Implementation Plan
 
+> **Implementation update:** The notification flow now uses two tools. `ask_hermes(message)` returns ordinary MCP text so Index AI can summarize Hermes's result; `deliver_response(text)` emits the Pebble `SemanticResult.Response` containing that summary. This supersedes the original one-tool/direct-response requirements below.
+
 ## 1. Repository identity
 
 **Repository name:** `index-hermes-bridge`

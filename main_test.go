@@ -63,7 +63,7 @@ func TestPebbleResults(t *testing.T) {
 		result   any
 		contains []string
 	}{
-		{pebbleResponse("four", "question"), []string{`"coreSchema":1`, `"type":"Response"`, `"text":"four"`, `"question":"question"`}},
+		{deliverResponse("four"), []string{`"coreSchema":1`, `"type":"Response"`, `"text":"four"`}},
 		{pebbleFailure("failed"), []string{`"isError":true`, `"type":"GenericFailure"`, `"userErrorMessage":"failed"`}},
 	} {
 		data, err := json.Marshal(tc.result)
@@ -119,6 +119,9 @@ func TestAskHermesSuccess(t *testing.T) {
 	data, _ := json.Marshal(result)
 	if !strings.Contains(string(data), "one\\n\\ntwo") {
 		t.Fatal(string(data))
+	}
+	if strings.Contains(string(data), "coreSchema") || strings.Contains(string(data), "semanticResult") {
+		t.Fatalf("ask_hermes must return ordinary MCP text: %s", data)
 	}
 }
 
@@ -180,7 +183,7 @@ func TestMCP2025InitializationAndToolList(t *testing.T) {
 		t.Fatalf("initialized: %d %s", resp.StatusCode, body)
 	}
 	resp, body = post(`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`, session)
-	if resp.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"name":"ask_hermes"`)) || bytes.Contains(body, []byte(`"nextCursor"`)) {
+	if resp.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"name":"ask_hermes"`)) || !bytes.Contains(body, []byte(`"name":"deliver_response"`)) || bytes.Contains(body, []byte(`"nextCursor"`)) {
 		t.Fatalf("tools/list: %d %s", resp.StatusCode, body)
 	}
 	var envelope struct {
@@ -193,7 +196,7 @@ func TestMCP2025InitializationAndToolList(t *testing.T) {
 	if err := json.Unmarshal(body, &envelope); err != nil {
 		t.Fatal(err)
 	}
-	if len(envelope.Result.Tools) != 1 {
+	if len(envelope.Result.Tools) != 2 {
 		t.Fatalf("got %d tools", len(envelope.Result.Tools))
 	}
 	if additional, ok := envelope.Result.Tools[0].InputSchema["additionalProperties"]; !ok || additional != false {
@@ -203,7 +206,17 @@ func TestMCP2025InitializationAndToolList(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("tools/call: %d %s", resp.StatusCode, body)
 	}
-	for _, want := range [][]byte{[]byte(`"coreSchema":1`), []byte(`"type":"Response"`), []byte(`"text":"four"`)} {
+	if bytes.Contains(body, []byte(`"coreSchema"`)) || bytes.Contains(body, []byte(`"semanticResult"`)) {
+		t.Fatalf("ask_hermes returned a final semantic result: %s", body)
+	}
+	if !bytes.Contains(body, []byte(`"text":"four"`)) {
+		t.Fatalf("ask_hermes response lacks Hermes text: %s", body)
+	}
+	resp, body = post(`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"deliver_response","arguments":{"text":"The answer is four."}}}`, session)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("deliver_response: %d %s", resp.StatusCode, body)
+	}
+	for _, want := range [][]byte{[]byte(`"coreSchema":1`), []byte(`"type":"Response"`), []byte(`"text":"The answer is four."`)} {
 		if !bytes.Contains(body, want) {
 			t.Fatalf("tools/call response lacks %s: %s", want, body)
 		}

@@ -62,7 +62,12 @@ Create a custom MCP server:
 - Transport: **Streamable HTTP**
 - Authorization: `Bearer <MCP_BEARER_TOKEN>`
 
-Assign it to the desired sandbox or gesture. The server exposes one tool: `ask_hermes(message)`.
+Assign it to the desired sandbox or gesture. The server exposes two tools:
+
+- `ask_hermes(message)` waits for Hermes and returns ordinary MCP text for Index AI to reason over.
+- `deliver_response(text)` turns Index AI's concise summary into the Pebble completion notification.
+
+Server instructions tell Index AI to call `ask_hermes`, summarize the result in 1–3 sentences, and finish by calling `deliver_response`.
 
 ## Audio
 
