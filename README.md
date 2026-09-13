@@ -6,6 +6,8 @@ A lightweight MCP bridge that sends Pebble Index requests to Hermes through Disc
 
 `Index -> MCP -> #index -> @Hermes -> Hermes thread -> MCP -> Index notification`
 
+If Hermes cannot create the canonical thread, the relay bot creates it from the source message and re-triggers Hermes inside.
+
 Discord remains the canonical Hermes conversation history.
 
 ## Requirements
@@ -34,6 +36,10 @@ Create a Discord application/bot, enable Message Content Intent, and grant it on
 - View Channel
 - Send Messages
 - Read Message History
+- Create Public Threads
+- Send Messages in Threads
+
+The relay bot uses thread-creation permission only when Hermes's own thread creation fails or is rate-limited. It does not need Manage Threads or Administrator.
 
 Record its token, the channel ID, and the Hermes bot user ID.
 

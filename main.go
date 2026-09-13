@@ -12,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf16"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -21,7 +22,7 @@ const (
 	mcpPath             = "/mcp"
 	discordMessageLimit = 2000
 	overallTimeout      = 50 * time.Second
-	threadTimeout       = 10 * time.Second
+	primaryThreadGrace  = 5 * time.Second
 	pollInterval        = time.Second
 )
 
@@ -38,8 +39,10 @@ type workflowOptions struct{ overall, thread, poll time.Duration }
 
 type discordWorkflow interface {
 	createRelayMessage(context.Context, string) (discordMessage, error)
-	threadExists(context.Context, string) (bool, error)
-	completion(context.Context, string) (completionState, error)
+	getThread(context.Context, string) (discordChannel, bool, error)
+	createThreadFromMessage(context.Context, string, string) (discordChannel, error)
+	createThreadMessage(context.Context, string, string) (discordMessage, error)
+	completion(context.Context, messageRef) (completionState, error)
 	threadText(context.Context, string) (string, error)
 }
 
@@ -74,7 +77,7 @@ func newMCPHandler(cfg config, discord discordWorkflow, options workflowOptions)
 		Description: "Send the user's complete request to their Hermes agent through Discord and return Hermes's response.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: &falseValue, IdempotentHint: false, OpenWorldHint: &trueValue},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input askHermesInput) (*mcp.CallToolResult, any, error) {
-		return askHermes(ctx, discord, cfg.HermesBotID, input, options), nil, nil
+		return askHermes(ctx, discord, cfg.DiscordChannelID, cfg.HermesBotID, input, options), nil, nil
 	})
 	mcp.AddTool[deliverResponseInput, any](server, &mcp.Tool{
 		Name:        "deliver_response",
@@ -91,7 +94,7 @@ func newMCPHandler(cfg config, discord discordWorkflow, options workflowOptions)
 	return securityMiddleware(cfg.MCPBearerToken, streamable)
 }
 
-func askHermes(parent context.Context, discord discordWorkflow, hermesID string, input askHermesInput, options workflowOptions) *mcp.CallToolResult {
+func askHermes(parent context.Context, discord discordWorkflow, parentChannelID, hermesID string, input askHermesInput, options workflowOptions) *mcp.CallToolResult {
 	message := strings.TrimSpace(input.Message)
 	if message == "" {
 		return pebbleFailure("No message was provided.")
@@ -107,25 +110,56 @@ func askHermes(parent context.Context, discord discordWorkflow, hermesID string,
 		return pebbleFailure("Discord could not receive the request.")
 	}
 	log.Printf("discord message created id=%s", source.ID)
+	completionTarget := messageRef{ChannelID: parentChannelID, MessageID: source.ID}
+	mode := "normal"
 	threadDeadline := time.Now().Add(options.thread)
+	var thread discordChannel
+	var exists bool
 	for {
-		exists, err := discord.threadExists(ctx, source.ID)
+		thread, exists, err = discord.getThread(ctx, source.ID)
 		if err != nil {
 			return pebbleFailure("Discord could not verify Hermes's thread.")
 		}
-		if exists {
+		if exists || time.Now().After(threadDeadline) {
 			break
-		}
-		if time.Now().After(threadDeadline) {
-			return pebbleFailure("Hermes did not create the expected Discord thread.")
 		}
 		if err := sleepContext(ctx, options.poll); err != nil {
 			return timeoutFailure(parent)
 		}
 	}
-	log.Printf("hermes thread detected id=%s", source.ID)
+	if !exists {
+		mode = "fallback"
+		log.Printf("Hermes thread absent; attempting relay fallback id=%s", source.ID)
+		thread, err = discord.createThreadFromMessage(ctx, source.ID, fallbackThreadName(message))
+		relayOwnsThread := err == nil
+		if err != nil {
+			log.Printf("fallback thread create failed id=%s error=%v", source.ID, err)
+			thread, exists, _ = discord.getThread(ctx, source.ID)
+			if !exists {
+				var rate *discordRateLimitError
+				if errors.As(err, &rate) {
+					return pebbleFailure(rateLimitFailure(rate.RetryAfter))
+				}
+				return pebbleFailure("Discord could not create a thread for this request.")
+			}
+			relayOwnsThread = thread.OwnerID != hermesID
+			if !relayOwnsThread {
+				mode = "normal"
+				log.Printf("fallback create raced with existing Hermes thread id=%s", source.ID)
+			}
+		}
+		if relayOwnsThread {
+			trigger, err := discord.createThreadMessage(ctx, source.ID, content)
+			if err != nil {
+				return pebbleFailure("The fallback thread was created, but Discord could not send the request inside it.")
+			}
+			completionTarget = messageRef{ChannelID: source.ID, MessageID: trigger.ID}
+			log.Printf("relay fallback trigger created thread=%s message=%s", source.ID, trigger.ID)
+		}
+	}
+	log.Printf("hermes thread detected id=%s owner=%s mode=%s", source.ID, thread.OwnerID, mode)
 	for {
-		state, err := discord.completion(ctx, source.ID)
+		state, err := discord.completion(ctx, completionTarget)
 		if err != nil {
 			if ctx.Err() != nil {
 				return timeoutFailure(parent)
@@ -143,13 +177,36 @@ func askHermes(parent context.Context, discord discordWorkflow, hermesID string,
 			if text == "" {
 				return pebbleFailure("Hermes completed without a text response.")
 			}
-			log.Printf("hermes completed id=%s", source.ID)
+			log.Printf("hermes completed thread=%s trigger=%s mode=%s", source.ID, completionTarget.MessageID, mode)
 			return textResult(text)
 		}
 		if err := sleepContext(ctx, options.poll); err != nil {
 			return timeoutFailure(parent)
 		}
 	}
+}
+
+func fallbackThreadName(message string) string {
+	message = strings.Join(strings.Fields(message), " ")
+	if message == "" {
+		return "Index"
+	}
+	units := 0
+	return strings.Map(func(r rune) rune {
+		units += utf16.RuneLen(r)
+		if units > 80 {
+			return -1
+		}
+		return r
+	}, message)
+}
+
+func rateLimitFailure(delay time.Duration) string {
+	minutes := (delay + time.Minute - 1) / time.Minute
+	if minutes >= 1 {
+		return fmt.Sprintf("Discord is rate-limiting thread creation. Please retry in about %d minute(s).", minutes)
+	}
+	return "Discord is rate-limiting thread creation. Please retry shortly."
 }
 
 func timeoutFailure(parent context.Context) *mcp.CallToolResult {
@@ -195,7 +252,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	handler := newMCPHandler(cfg, newDiscordClient(cfg.DiscordBotToken, cfg.DiscordChannelID, cfg.HermesBotID), workflowOptions{overallTimeout, threadTimeout, pollInterval})
+	handler := newMCPHandler(cfg, newDiscordClient(cfg.DiscordBotToken, cfg.DiscordChannelID, cfg.HermesBotID), workflowOptions{overallTimeout, primaryThreadGrace, pollInterval})
 	mux := http.NewServeMux()
 	mux.Handle(mcpPath, handler)
 	server := &http.Server{Addr: listenAddress, Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 2 * time.Minute}

@@ -17,6 +17,7 @@ import (
 )
 
 const discordAPI = "https://discord.com/api/v10"
+const shortRateLimit = 2 * time.Second
 
 type discordClient struct {
 	token, channelID, hermesID, baseURL string
@@ -38,6 +39,30 @@ type discordMessage struct {
 	Author    discordUser       `json:"author"`
 	Reactions []discordReaction `json:"reactions"`
 }
+type messageRef struct{ ChannelID, MessageID string }
+type discordChannel struct {
+	ID       string `json:"id"`
+	OwnerID  string `json:"owner_id"`
+	ParentID string `json:"parent_id"`
+	Type     int    `json:"type"`
+}
+type discordRateLimitError struct {
+	RetryAfter time.Duration
+	Scope      string
+}
+
+func (e *discordRateLimitError) Error() string {
+	return fmt.Sprintf("discord rate limited for %s (scope=%s)", e.RetryAfter, e.Scope)
+}
+
+type discordHTTPError struct {
+	Status, Code int
+	Message      string
+}
+
+func (e *discordHTTPError) Error() string {
+	return fmt.Sprintf("discord returned HTTP %d code=%d: %s", e.Status, e.Code, e.Message)
+}
 
 type completionState int
 
@@ -52,33 +77,54 @@ func newDiscordClient(token, channelID, hermesID string) *discordClient {
 }
 
 func (d *discordClient) createRelayMessage(ctx context.Context, content string) (discordMessage, error) {
+	return d.createMessage(ctx, d.channelID, content)
+}
+func (d *discordClient) createThreadMessage(ctx context.Context, threadID, content string) (discordMessage, error) {
+	return d.createMessage(ctx, threadID, content)
+}
+func (d *discordClient) createMessage(ctx context.Context, channelID, content string) (discordMessage, error) {
 	var raw [12]byte
 	if _, err := rand.Read(raw[:]); err != nil {
 		return discordMessage{}, err
 	}
-	nonce := hex.EncodeToString(raw[:])
 	body := map[string]any{
 		"content":          content,
 		"allowed_mentions": map[string]any{"parse": []string{}, "users": []string{d.hermesID}},
-		"nonce":            nonce,
+		"nonce":            hex.EncodeToString(raw[:]),
 		"enforce_nonce":    true,
 	}
 	var message discordMessage
-	err := d.doJSON(ctx, http.MethodPost, "/channels/"+d.channelID+"/messages", body, &message)
+	err := d.doJSON(ctx, http.MethodPost, "/channels/"+channelID+"/messages", body, &message)
 	return message, err
 }
 
-func (d *discordClient) threadExists(ctx context.Context, id string) (bool, error) {
-	status, err := d.do(ctx, http.MethodGet, "/channels/"+id, nil, nil)
+func (d *discordClient) getThread(ctx context.Context, id string) (discordChannel, bool, error) {
+	var thread discordChannel
+	status, err := d.do(ctx, http.MethodGet, "/channels/"+id, nil, &thread)
 	if status == http.StatusNotFound {
-		return false, nil
+		return discordChannel{}, false, nil
 	}
-	return status >= 200 && status < 300, err
+	if err != nil {
+		return discordChannel{}, false, err
+	}
+	if thread.ID != id || thread.ParentID != d.channelID || thread.Type != 11 {
+		return discordChannel{}, false, errors.New("discord returned an invalid canonical thread")
+	}
+	return thread, true, nil
 }
 
-func (d *discordClient) completion(ctx context.Context, sourceID string) (completionState, error) {
+func (d *discordClient) createThreadFromMessage(ctx context.Context, sourceID, name string) (discordChannel, error) {
+	var thread discordChannel
+	err := d.doJSON(ctx, http.MethodPost, "/channels/"+d.channelID+"/messages/"+sourceID+"/threads", map[string]any{"name": name, "auto_archive_duration": 1440}, &thread)
+	if err == nil && (thread.ID != sourceID || thread.ParentID != d.channelID || thread.Type != 11) {
+		err = errors.New("discord returned an invalid fallback thread")
+	}
+	return thread, err
+}
+
+func (d *discordClient) completion(ctx context.Context, ref messageRef) (completionState, error) {
 	var message discordMessage
-	if err := d.doJSON(ctx, http.MethodGet, "/channels/"+d.channelID+"/messages/"+sourceID, nil, &message); err != nil {
+	if err := d.doJSON(ctx, http.MethodGet, "/channels/"+ref.ChannelID+"/messages/"+ref.MessageID, nil, &message); err != nil {
 		return completionPending, err
 	}
 	for _, candidate := range []struct {
@@ -87,7 +133,7 @@ func (d *discordClient) completion(ctx context.Context, sourceID string) (comple
 	}{{"❌", completionFailed}, {"✅", completionSucceeded}} {
 		for _, reaction := range message.Reactions {
 			if reaction.Count > 0 && reaction.Emoji.Name == candidate.name {
-				ok, err := d.reactionHasHermes(ctx, sourceID, candidate.name)
+				ok, err := d.reactionHasHermes(ctx, ref, candidate.name)
 				if err != nil {
 					return completionPending, err
 				}
@@ -100,9 +146,9 @@ func (d *discordClient) completion(ctx context.Context, sourceID string) (comple
 	return completionPending, nil
 }
 
-func (d *discordClient) reactionHasHermes(ctx context.Context, sourceID, emoji string) (bool, error) {
+func (d *discordClient) reactionHasHermes(ctx context.Context, ref messageRef, emoji string) (bool, error) {
 	var users []discordUser
-	path := "/channels/" + d.channelID + "/messages/" + sourceID + "/reactions/" + url.PathEscape(emoji) + "?limit=100"
+	path := "/channels/" + ref.ChannelID + "/messages/" + ref.MessageID + "/reactions/" + url.PathEscape(emoji) + "?limit=100"
 	if err := d.doJSON(ctx, http.MethodGet, path, nil, &users); err != nil {
 		return false, err
 	}
@@ -165,23 +211,32 @@ func (d *discordClient) do(ctx context.Context, method, path string, body []byte
 		if readErr != nil {
 			return resp.StatusCode, readErr
 		}
-		if resp.StatusCode == http.StatusTooManyRequests && attempt == 0 {
-			var rate struct {
+		if resp.StatusCode == http.StatusTooManyRequests {
+			var detail struct {
 				RetryAfter float64 `json:"retry_after"`
 			}
-			if json.Unmarshal(data, &rate) != nil {
+			if json.Unmarshal(data, &detail) != nil {
 				return resp.StatusCode, errors.New("discord rate limit response was invalid")
 			}
-			if err := sleepContext(ctx, time.Duration(rate.RetryAfter*float64(time.Second))); err != nil {
-				return resp.StatusCode, err
+			rate := &discordRateLimitError{RetryAfter: time.Duration(detail.RetryAfter * float64(time.Second)), Scope: resp.Header.Get("X-RateLimit-Scope")}
+			if attempt == 0 && rate.RetryAfter <= shortRateLimit {
+				if err := sleepContext(ctx, rate.RetryAfter); err != nil {
+					return resp.StatusCode, err
+				}
+				continue
 			}
-			continue
+			return resp.StatusCode, rate
 		}
 		if resp.StatusCode >= 500 && attempt == 0 {
 			continue
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return resp.StatusCode, fmt.Errorf("discord returned HTTP %d", resp.StatusCode)
+			var detail struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			}
+			_ = json.Unmarshal(data, &detail)
+			return resp.StatusCode, &discordHTTPError{Status: resp.StatusCode, Code: detail.Code, Message: detail.Message}
 		}
 		if out != nil && len(data) > 0 {
 			if err := json.Unmarshal(data, out); err != nil {
