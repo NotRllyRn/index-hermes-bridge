@@ -68,6 +68,7 @@ type completionState int
 
 const (
 	completionPending completionState = iota
+	completionProcessing
 	completionSucceeded
 	completionFailed
 )
@@ -130,7 +131,7 @@ func (d *discordClient) completion(ctx context.Context, ref messageRef) (complet
 	for _, candidate := range []struct {
 		name  string
 		state completionState
-	}{{"❌", completionFailed}, {"✅", completionSucceeded}} {
+	}{{"❌", completionFailed}, {"✅", completionSucceeded}, {"👀", completionProcessing}} {
 		for _, reaction := range message.Reactions {
 			if reaction.Count > 0 && reaction.Emoji.Name == candidate.name {
 				ok, err := d.reactionHasHermes(ctx, ref, candidate.name)

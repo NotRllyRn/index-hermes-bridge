@@ -177,6 +177,21 @@ func TestDiscordNoRetryOnForbiddenPreservesError(t *testing.T) {
 	}
 }
 
+func TestCompletionDetectsReceipt(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/reactions/") {
+			_, _ = w.Write([]byte(`[{"id":"456"}]`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"reactions":[{"count":1,"emoji":{"name":"👀"}}]}`))
+	}))
+	defer server.Close()
+	state, err := testDiscord(server).completion(context.Background(), messageRef{ChannelID: "123", MessageID: "789"})
+	if err != nil || state != completionProcessing {
+		t.Fatalf("state=%v err=%v", state, err)
+	}
+}
+
 func TestThreadTextChronologicalHermesOnly(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(`[

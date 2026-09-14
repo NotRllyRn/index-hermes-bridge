@@ -29,6 +29,22 @@ func TestLoadConfig(t *testing.T) {
 	}
 }
 
+func TestNtfyConfig(t *testing.T) {
+	base := map[string]string{"MCP_BEARER_TOKEN": strings.Repeat("a", 64), "DISCORD_BOT_TOKEN": "bot", "DISCORD_CHANNEL_ID": "123", "HERMES_BOT_ID": "456"}
+	if _, err := loadConfig(func(k string) string { return base[k] }); err != nil {
+		t.Fatal(err)
+	}
+	base["NTFY_SERVER_URL"], base["NTFY_TOPIC"] = "https://ntfy.example", "index"
+	cfg, err := loadConfig(func(k string) string { return base[k] })
+	if err != nil || cfg.NtfyTopic != "index" {
+		t.Fatalf("cfg=%+v err=%v", cfg, err)
+	}
+	delete(base, "NTFY_TOPIC")
+	if _, err := loadConfig(func(k string) string { return base[k] }); err == nil {
+		t.Fatal("expected paired config error")
+	}
+}
+
 func mapsClone(in map[string]string) map[string]string {
 	out := map[string]string{}
 	for k, v := range in {
@@ -64,7 +80,7 @@ func TestPebbleResults(t *testing.T) {
 		result   any
 		contains []string
 	}{
-		{deliverResponse("four"), []string{`"coreSchema":1`, `"type":"Response"`, `"text":"four"`}},
+		{pebbleResponse("Hermes will reply soon"), []string{`"coreSchema":1`, `"type":"Response"`, `"text":"Hermes will reply soon"`}},
 		{pebbleFailure("failed"), []string{`"isError":true`, `"type":"GenericFailure"`, `"userErrorMessage":"failed"`}},
 	} {
 		data, err := json.Marshal(tc.result)
@@ -126,7 +142,7 @@ func (f *fakeWorkflow) threadText(context.Context, string) (string, error) { ret
 
 func TestAskHermesSuccess(t *testing.T) {
 	f := &fakeWorkflow{source: discordMessage{ID: "99"}, states: []completionState{completionPending, completionSucceeded}, text: "one\n\ntwo"}
-	result := askHermes(context.Background(), f, "123", "456", askHermesInput{Message: " hello "}, workflowOptions{time.Second, time.Second, time.Millisecond})
+	result := askHermes(context.Background(), f, nil, "123", "456", askHermesInput{Message: " hello "}, workflowOptions{time.Second, time.Second, time.Millisecond})
 	if result.IsError {
 		t.Fatal("unexpected failure")
 	}
@@ -134,11 +150,8 @@ func TestAskHermesSuccess(t *testing.T) {
 		t.Fatalf("created=%q checks=%d", f.created, f.threadChecks)
 	}
 	data, _ := json.Marshal(result)
-	if !strings.Contains(string(data), "one\\n\\ntwo") {
+	if !strings.Contains(string(data), "Hermes will reply soon") || !strings.Contains(string(data), "coreSchema") {
 		t.Fatal(string(data))
-	}
-	if strings.Contains(string(data), "coreSchema") || strings.Contains(string(data), "semanticResult") {
-		t.Fatalf("ask_hermes must return ordinary MCP text: %s", data)
 	}
 }
 
@@ -148,7 +161,7 @@ func TestAskHermesFallback(t *testing.T) {
 		thread:  discordChannel{ID: "99", OwnerID: "relay", ParentID: "123", Type: 11},
 		trigger: discordMessage{ID: "101"}, states: []completionState{completionSucceeded}, text: "answer",
 	}
-	result := askHermes(context.Background(), f, "123", "456", askHermesInput{Message: "  hello\nworld  "}, workflowOptions{time.Second, time.Millisecond, time.Millisecond})
+	result := askHermes(context.Background(), f, nil, "123", "456", askHermesInput{Message: "  hello\nworld  "}, workflowOptions{time.Second, time.Millisecond, time.Millisecond})
 	if result.IsError {
 		t.Fatal("unexpected failure")
 	}
@@ -167,7 +180,7 @@ func TestAskHermesFallbackRace(t *testing.T) {
 		thread:          discordChannel{ID: "99", OwnerID: "456", ParentID: "123", Type: 11},
 		createThreadErr: errors.New("ambiguous"), states: []completionState{completionSucceeded}, text: "answer",
 	}
-	result := askHermes(context.Background(), f, "123", "456", askHermesInput{Message: "hello"}, workflowOptions{time.Second, 0, time.Millisecond})
+	result := askHermes(context.Background(), f, nil, "123", "456", askHermesInput{Message: "hello"}, workflowOptions{time.Second, 0, time.Millisecond})
 	if result.IsError || f.triggerContent != "" {
 		t.Fatalf("result=%+v trigger=%q", result, f.triggerContent)
 	}
@@ -184,7 +197,7 @@ func TestAskHermesFallbackAmbiguousRelayCreate(t *testing.T) {
 		createThreadErr: errors.New("connection lost"), trigger: discordMessage{ID: "101"},
 		states: []completionState{completionSucceeded}, text: "answer",
 	}
-	result := askHermes(context.Background(), f, "123", "456", askHermesInput{Message: "hello"}, workflowOptions{time.Second, 0, time.Millisecond})
+	result := askHermes(context.Background(), f, nil, "123", "456", askHermesInput{Message: "hello"}, workflowOptions{time.Second, 0, time.Millisecond})
 	if result.IsError || f.triggerContent == "" {
 		t.Fatalf("result=%+v trigger=%q", result, f.triggerContent)
 	}
@@ -200,7 +213,7 @@ func TestAskHermesFallbackLongRateLimit(t *testing.T) {
 		createThreadErr: &discordRateLimitError{RetryAfter: 278 * time.Second, Scope: "user"},
 	}
 	start := time.Now()
-	result := askHermes(context.Background(), f, "123", "456", askHermesInput{Message: "hello"}, workflowOptions{time.Second, 0, time.Millisecond})
+	result := askHermes(context.Background(), f, nil, "123", "456", askHermesInput{Message: "hello"}, workflowOptions{time.Second, 0, time.Millisecond})
 	if !result.IsError || f.triggerContent != "" || time.Since(start) > time.Second {
 		t.Fatalf("result=%+v trigger=%q", result, f.triggerContent)
 	}
@@ -219,7 +232,7 @@ func TestFallbackThreadNameUTF16Limit(t *testing.T) {
 
 func TestAskHermesFailureAndCancellation(t *testing.T) {
 	f := &fakeWorkflow{source: discordMessage{ID: "99"}, states: []completionState{completionFailed}}
-	result := askHermes(context.Background(), f, "123", "456", askHermesInput{Message: "hello"}, workflowOptions{time.Second, time.Second, time.Millisecond})
+	result := askHermes(context.Background(), f, nil, "123", "456", askHermesInput{Message: "hello"}, workflowOptions{time.Second, time.Second, time.Millisecond})
 	if !result.IsError {
 		t.Fatal("expected failure")
 	}
@@ -227,7 +240,7 @@ func TestAskHermesFailureAndCancellation(t *testing.T) {
 	cancelled := &fakeWorkflow{source: discordMessage{ID: "99"}}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	result = askHermes(ctx, cancelled, "123", "456", askHermesInput{Message: "hello"}, workflowOptions{time.Second, time.Second, time.Millisecond})
+	result = askHermes(ctx, cancelled, nil, "123", "456", askHermesInput{Message: "hello"}, workflowOptions{time.Second, time.Second, time.Millisecond})
 	if !result.IsError {
 		t.Fatal("expected cancellation failure")
 	}
@@ -236,7 +249,7 @@ func TestAskHermesFailureAndCancellation(t *testing.T) {
 func TestMCP2025InitializationAndToolList(t *testing.T) {
 	cfg := config{MCPBearerToken: strings.Repeat("a", 64), HermesBotID: "456"}
 	fake := &fakeWorkflow{source: discordMessage{ID: "99"}, states: []completionState{completionSucceeded}, text: "four"}
-	server := httptest.NewServer(newMCPHandler(cfg, fake, workflowOptions{time.Second, time.Second, time.Millisecond}))
+	server := httptest.NewServer(newMCPHandler(cfg, fake, nil, workflowOptions{time.Second, time.Second, time.Millisecond}))
 	defer server.Close()
 
 	post := func(payload string, session string) (*http.Response, []byte) {
@@ -275,7 +288,7 @@ func TestMCP2025InitializationAndToolList(t *testing.T) {
 		t.Fatalf("initialized: %d %s", resp.StatusCode, body)
 	}
 	resp, body = post(`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`, session)
-	if resp.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"name":"ask_hermes"`)) || !bytes.Contains(body, []byte(`"name":"deliver_response"`)) || bytes.Contains(body, []byte(`"nextCursor"`)) {
+	if resp.StatusCode != http.StatusOK || !bytes.Contains(body, []byte(`"name":"ask_hermes"`)) || bytes.Contains(body, []byte(`"nextCursor"`)) {
 		t.Fatalf("tools/list: %d %s", resp.StatusCode, body)
 	}
 	var envelope struct {
@@ -288,7 +301,7 @@ func TestMCP2025InitializationAndToolList(t *testing.T) {
 	if err := json.Unmarshal(body, &envelope); err != nil {
 		t.Fatal(err)
 	}
-	if len(envelope.Result.Tools) != 2 {
+	if len(envelope.Result.Tools) != 1 {
 		t.Fatalf("got %d tools", len(envelope.Result.Tools))
 	}
 	if additional, ok := envelope.Result.Tools[0].InputSchema["additionalProperties"]; !ok || additional != false {
@@ -298,29 +311,32 @@ func TestMCP2025InitializationAndToolList(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("tools/call: %d %s", resp.StatusCode, body)
 	}
-	if bytes.Contains(body, []byte(`"coreSchema"`)) || bytes.Contains(body, []byte(`"semanticResult"`)) {
-		t.Fatalf("ask_hermes returned a final semantic result: %s", body)
-	}
-	if !bytes.Contains(body, []byte(`"text":"four"`)) {
-		t.Fatalf("ask_hermes response lacks Hermes text: %s", body)
-	}
-	resp, body = post(`{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"deliver_response","arguments":{"text":"The answer is four."}}}`, session)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("deliver_response: %d %s", resp.StatusCode, body)
-	}
-	for _, want := range [][]byte{[]byte(`"coreSchema":1`), []byte(`"type":"Response"`), []byte(`"text":"The answer is four."`)} {
+	for _, want := range [][]byte{[]byte(`"coreSchema":1`), []byte(`"type":"Response"`), []byte(`"text":"Hermes will reply soon"`)} {
 		if !bytes.Contains(body, want) {
 			t.Fatalf("tools/call response lacks %s: %s", want, body)
 		}
 	}
 }
 
+type fakeNotifier struct{ text string }
+
+func (n *fakeNotifier) send(_ context.Context, text string) error { n.text = text; return nil }
+
+func TestAwaitAndNotify(t *testing.T) {
+	f := &fakeWorkflow{states: []completionState{completionSucceeded}, text: "Hermes answer"}
+	n := &fakeNotifier{}
+	awaitAndNotify(f, n, "99", messageRef{ChannelID: "123", MessageID: "99"}, completionProcessing, time.Millisecond)
+	if n.text != "Hermes answer" {
+		t.Fatalf("notification=%q", n.text)
+	}
+}
+
 func TestInputValidation(t *testing.T) {
 	f := &fakeWorkflow{}
-	if !askHermes(context.Background(), f, "123", "1", askHermesInput{}, workflowOptions{}).IsError {
+	if !askHermes(context.Background(), f, nil, "123", "1", askHermesInput{}, workflowOptions{}).IsError {
 		t.Fatal("empty input accepted")
 	}
-	if !askHermes(context.Background(), f, "123", "1", askHermesInput{Message: strings.Repeat("x", 2000)}, workflowOptions{}).IsError {
+	if !askHermes(context.Background(), f, nil, "123", "1", askHermesInput{Message: strings.Repeat("x", 2000)}, workflowOptions{}).IsError {
 		t.Fatal("long input accepted")
 	}
 }

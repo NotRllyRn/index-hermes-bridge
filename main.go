@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -24,18 +25,19 @@ const (
 	overallTimeout      = 50 * time.Second
 	primaryThreadGrace  = 5 * time.Second
 	pollInterval        = time.Second
+	backgroundTimeout   = 30 * time.Minute
 )
 
-const serverInstructions = "Use `ask_hermes` for every request and pass the user's complete request unchanged. After Hermes responds, summarize the answer in 1-3 concise sentences suitable for a phone notification, preserving the conclusion and any immediately important action. Ignore tool-progress/status messages. Then call `deliver_response` with only that summary."
+const serverInstructions = "Use `ask_hermes` for every request and pass the user's complete request unchanged. Hermes will answer asynchronously through a notification."
 
-type config struct{ MCPBearerToken, DiscordBotToken, DiscordChannelID, HermesBotID string }
+type config struct{ MCPBearerToken, DiscordBotToken, DiscordChannelID, HermesBotID, NtfyServerURL, NtfyTopic string }
 type askHermesInput struct {
 	Message string `json:"message" jsonschema:"The user's complete request to Hermes."`
 }
-type deliverResponseInput struct {
-	Text string `json:"text" jsonschema:"A concise 1-3 sentence summary for the user's phone notification."`
-}
 type workflowOptions struct{ overall, thread, poll time.Duration }
+type notificationSender interface {
+	send(context.Context, string) error
+}
 
 type discordWorkflow interface {
 	createRelayMessage(context.Context, string) (discordMessage, error)
@@ -66,10 +68,21 @@ func loadConfig(getenv func(string) string) (config, error) {
 	if !decimalID(cfg.HermesBotID) {
 		return config{}, errors.New("HERMES_BOT_ID must be a decimal Discord ID")
 	}
+	cfg.NtfyServerURL = strings.TrimSpace(getenv("NTFY_SERVER_URL"))
+	cfg.NtfyTopic = strings.Trim(strings.TrimSpace(getenv("NTFY_TOPIC")), "/")
+	if (cfg.NtfyServerURL == "") != (cfg.NtfyTopic == "") {
+		return config{}, errors.New("NTFY_SERVER_URL and NTFY_TOPIC must be set together")
+	}
+	if cfg.NtfyServerURL != "" {
+		u, err := url.ParseRequestURI(cfg.NtfyServerURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return config{}, errors.New("NTFY_SERVER_URL must be an HTTP or HTTPS URL")
+		}
+	}
 	return cfg, nil
 }
 
-func newMCPHandler(cfg config, discord discordWorkflow, options workflowOptions) http.Handler {
+func newMCPHandler(cfg config, discord discordWorkflow, notifications notificationSender, options workflowOptions) http.Handler {
 	server := mcp.NewServer(&mcp.Implementation{Name: "index-hermes-bridge", Version: "1.0.0"}, &mcp.ServerOptions{Instructions: serverInstructions})
 	falseValue, trueValue := false, true
 	mcp.AddTool[askHermesInput, any](server, &mcp.Tool{
@@ -77,14 +90,7 @@ func newMCPHandler(cfg config, discord discordWorkflow, options workflowOptions)
 		Description: "Send the user's complete request to their Hermes agent through Discord and return Hermes's response.",
 		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: &falseValue, IdempotentHint: false, OpenWorldHint: &trueValue},
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, input askHermesInput) (*mcp.CallToolResult, any, error) {
-		return askHermes(ctx, discord, cfg.DiscordChannelID, cfg.HermesBotID, input, options), nil, nil
-	})
-	mcp.AddTool[deliverResponseInput, any](server, &mcp.Tool{
-		Name:        "deliver_response",
-		Description: "Deliver the concise final answer as the Pebble completion notification.",
-		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true, DestructiveHint: &falseValue, IdempotentHint: true, OpenWorldHint: &falseValue},
-	}, func(_ context.Context, _ *mcp.CallToolRequest, input deliverResponseInput) (*mcp.CallToolResult, any, error) {
-		return deliverResponse(input.Text), nil, nil
+		return askHermes(ctx, discord, notifications, cfg.DiscordChannelID, cfg.HermesBotID, input, options), nil, nil
 	})
 	streamable := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, &mcp.StreamableHTTPOptions{
 		JSONResponse:               true,
@@ -94,7 +100,7 @@ func newMCPHandler(cfg config, discord discordWorkflow, options workflowOptions)
 	return securityMiddleware(cfg.MCPBearerToken, streamable)
 }
 
-func askHermes(parent context.Context, discord discordWorkflow, parentChannelID, hermesID string, input askHermesInput, options workflowOptions) *mcp.CallToolResult {
+func askHermes(parent context.Context, discord discordWorkflow, notifications notificationSender, parentChannelID, hermesID string, input askHermesInput, options workflowOptions) *mcp.CallToolResult {
 	message := strings.TrimSpace(input.Message)
 	if message == "" {
 		return pebbleFailure("No message was provided.")
@@ -164,26 +170,53 @@ func askHermes(parent context.Context, discord discordWorkflow, parentChannelID,
 			if ctx.Err() != nil {
 				return timeoutFailure(parent)
 			}
-			return pebbleFailure("Discord could not check Hermes's status.")
+			return pebbleFailure("Discord could not check whether Hermes received the request.")
 		}
-		switch state {
-		case completionFailed:
+		if state == completionFailed {
 			return pebbleFailure("Hermes reported that the request failed.")
-		case completionSucceeded:
-			text, err := discord.threadText(ctx, source.ID)
-			if err != nil {
-				return pebbleFailure("Discord could not read Hermes's response.")
+		}
+		if state == completionProcessing || state == completionSucceeded {
+			log.Printf("hermes received thread=%s trigger=%s mode=%s", source.ID, completionTarget.MessageID, mode)
+			if notifications != nil {
+				go awaitAndNotify(discord, notifications, source.ID, completionTarget, state, options.poll)
 			}
-			if text == "" {
-				return pebbleFailure("Hermes completed without a text response.")
-			}
-			log.Printf("hermes completed thread=%s trigger=%s mode=%s", source.ID, completionTarget.MessageID, mode)
-			return textResult(text)
+			return pebbleResponse("Hermes will reply soon")
 		}
 		if err := sleepContext(ctx, options.poll); err != nil {
 			return timeoutFailure(parent)
 		}
 	}
+}
+
+func awaitAndNotify(discord discordWorkflow, notifications notificationSender, threadID string, target messageRef, state completionState, poll time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), backgroundTimeout)
+	defer cancel()
+	for state != completionSucceeded {
+		var err error
+		state, err = discord.completion(ctx, target)
+		if err != nil {
+			log.Printf("background completion check failed thread=%s error=%v", threadID, err)
+			return
+		}
+		if state == completionFailed {
+			log.Printf("hermes failed thread=%s", threadID)
+			return
+		}
+		if err := sleepContext(ctx, poll); err != nil {
+			log.Printf("background wait ended thread=%s error=%v", threadID, err)
+			return
+		}
+	}
+	text, err := discord.threadText(ctx, threadID)
+	if err != nil || text == "" {
+		log.Printf("background response read failed thread=%s error=%v", threadID, err)
+		return
+	}
+	if err := notifications.send(ctx, text); err != nil {
+		log.Printf("ntfy delivery failed thread=%s error=%v", threadID, err)
+		return
+	}
+	log.Printf("ntfy notification sent thread=%s", threadID)
 }
 
 func fallbackThreadName(message string) string {
@@ -216,14 +249,7 @@ func timeoutFailure(parent context.Context) *mcp.CallToolResult {
 	return pebbleFailure("Hermes did not respond before the Index timeout.")
 }
 
-func textResult(text string) *mcp.CallToolResult {
-	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}
-}
-func deliverResponse(text string) *mcp.CallToolResult {
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return pebbleFailure("No response was provided.")
-	}
+func pebbleResponse(text string) *mcp.CallToolResult {
 	return &mcp.CallToolResult{Meta: mcp.Meta{"coreSchema": 1}, Content: []mcp.Content{&mcp.TextContent{Text: text}}, StructuredContent: map[string]any{"output": text, "semanticResult": map[string]any{"type": "Response", "text": text}}}
 }
 func pebbleFailure(text string) *mcp.CallToolResult {
@@ -252,7 +278,12 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	handler := newMCPHandler(cfg, newDiscordClient(cfg.DiscordBotToken, cfg.DiscordChannelID, cfg.HermesBotID), workflowOptions{overallTimeout, primaryThreadGrace, pollInterval})
+	discord := newDiscordClient(cfg.DiscordBotToken, cfg.DiscordChannelID, cfg.HermesBotID)
+	var notifications notificationSender
+	if cfg.NtfyServerURL != "" {
+		notifications = newNtfyClient(cfg.NtfyServerURL, cfg.NtfyTopic, &http.Client{Timeout: 10 * time.Second})
+	}
+	handler := newMCPHandler(cfg, discord, notifications, workflowOptions{overallTimeout, primaryThreadGrace, pollInterval})
 	mux := http.NewServeMux()
 	mux.Handle(mcpPath, handler)
 	server := &http.Server{Addr: listenAddress, Handler: mux, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 2 * time.Minute}
