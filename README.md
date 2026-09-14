@@ -1,10 +1,10 @@
 # index-hermes-bridge
 
-A lightweight MCP bridge that sends Pebble Index requests to Hermes through Discord and returns Hermes responses to Index.
+A lightweight MCP bridge that sends Pebble Index requests to Hermes through Discord and optionally delivers responses through ntfy.
 
 ## How it works
 
-`Index -> MCP -> #index -> @Hermes -> Hermes thread -> MCP -> Index notification`
+`Index -> MCP acknowledgement -> #index -> @Hermes -> Hermes thread -> ntfy notification`
 
 If Hermes cannot create the canonical thread, the relay bot creates it from the source message and re-triggers Hermes inside.
 
@@ -60,6 +60,15 @@ docker compose up -d --build
 tailscale serve --bg 8080
 ```
 
+To receive completed Hermes replies through ntfy, set both optional values:
+
+```env
+NTFY_SERVER_URL="https://ntfy.example.com"
+NTFY_TOPIC="index-hermes"
+```
+
+Leave both empty to disable ntfy. The bridge waits in the background for Hermes's final reaction and posts the completed Discord response as plain text to that topic.
+
 ## Pebble Index
 
 Create a custom MCP server:
@@ -68,12 +77,9 @@ Create a custom MCP server:
 - Transport: **Streamable HTTP**
 - Authorization: `Bearer <MCP_BEARER_TOKEN>`
 
-Assign it to the desired sandbox or gesture. The server exposes two tools:
+Assign it to the desired sandbox or gesture. The server exposes one tool: `ask_hermes(message)`.
 
-- `ask_hermes(message)` waits for Hermes and returns ordinary MCP text for Index AI to reason over.
-- `deliver_response(text)` turns Index AI's concise summary into the Pebble completion notification.
-
-Server instructions tell Index AI to call `ask_hermes`, summarize the result in 1–3 sentences, and finish by calling `deliver_response`.
+The tool returns **“Hermes will reply soon”** as soon as Hermes acknowledges the Discord message. It does not hold the MCP request open while Hermes works. If ntfy is configured, the final reply arrives there later.
 
 ## Audio
 

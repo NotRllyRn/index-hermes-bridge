@@ -1,6 +1,6 @@
 # Index Hermes Bridge — Software Design & Implementation Plan
 
-> **Implementation update:** The notification flow now uses two tools. `ask_hermes(message)` returns ordinary MCP text so Index AI can summarize Hermes's result; `deliver_response(text)` emits the Pebble `SemanticResult.Response` containing that summary. This supersedes the original one-tool/direct-response requirements below.
+> **Implementation update:** `ask_hermes(message)` now returns “Hermes will reply soon” after Hermes acknowledges the Discord message. When optional ntfy settings are present, the bridge waits for completion in a bounded background goroutine and publishes the final Discord response to ntfy. This supersedes the original synchronous and two-tool response requirements below.
 
 ## 1. Repository identity
 
